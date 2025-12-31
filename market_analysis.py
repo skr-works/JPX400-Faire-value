@@ -11,7 +11,7 @@ import jpholiday
 import time
 import random
 
-# --- 設定: 汎用的な同期設定 ---
+# --- 設定 ---
 try:
     config_json = os.environ["SYNC_CONFIG"]
     config = json.loads(config_json)
@@ -28,6 +28,14 @@ except json.JSONDecodeError:
     print("Invalid configuration format.")
     sys.exit(1)
 
+# --- グローバル変数: スキップ理由の集計用 ---
+skip_reasons = {
+    "No_Price": 0,
+    "No_EPS": 0,
+    "Abnormal_Data": 0,
+    "Fetch_Error": 0
+}
+
 # --- 1. カレンダーチェック ---
 def check_calendar():
     jst_tz = pytz.timezone('Asia/Tokyo')
@@ -43,43 +51,57 @@ def check_calendar():
 
     print(f"Market Open: {today}")
 
-# --- 個別銘柄処理 ---
+# --- 個別銘柄処理 (リトライと強化版) ---
 def analyze_stock(args):
     code, jp_name = args
     ticker_symbol = f"{code}.T"
     
-    # 対策: サーバー負荷を減らし、ブロック回避のために少し待つ
-    time.sleep(random.uniform(0.5, 2.0))
-    
-    try:
-        stock = yf.Ticker(ticker_symbol)
-        # fast_infoは早いがinfoの方が確実な場合が多い。エラー時はNoneを返す
+    # ブロック回避のためのランダム待機
+    time.sleep(random.uniform(1.0, 3.0))
+
+    # リトライ処理 (最大3回)
+    info = None
+    for i in range(3):
         try:
+            stock = yf.Ticker(ticker_symbol)
+            # info取得を試みる
             info = stock.info
+            if info and 'currentPrice' in info:
+                break # 成功したらループを抜ける
         except Exception:
-            # 取得失敗時はNoneで戻る
-            return None
-        
+            time.sleep(2) # エラー時は少し待って再試行
+            pass
+    
+    # 3回やってもダメ、または必須データがない場合
+    if info is None:
+        skip_reasons["Fetch_Error"] += 1
+        return None
+
+    try:
         price = info.get('currentPrice')
-        
-        # 必須データチェック
         if price is None:
+            skip_reasons["No_Price"] += 1
             return None
 
-        # EPS取得
+        # EPS取得 (優先順位: forward -> trailing -> 0)
+        # 日本株はforwardEpsが欠損していることが多い
         eps = info.get('forwardEps')
         if eps is None:
             eps = info.get('trailingEps')
             
+        # EPSがどうしても取れない、または赤字(マイナス)の場合は計算不能
         if eps is None or eps <= 0:
+            skip_reasons["No_EPS"] += 1
             return None
 
-        # 成長率
+        # 成長率 (earningsGrowthがない場合が多いので、revenueGrowthを見る。なければ0とする)
         growth_raw = info.get('earningsGrowth')
         if growth_raw is None:
             growth_raw = info.get('revenueGrowth')
+        
+        # 成長率不明時は 0% (保守的) とする ※以前は5%だったが、より確実に通すため0%採用
         if growth_raw is None:
-            growth_raw = 0.05 # Default 5%
+            growth_raw = 0.0
 
         # 配当利回り
         yield_raw = info.get('dividendYield', 0)
@@ -89,18 +111,29 @@ def analyze_stock(args):
         growth_pct = growth_raw * 100
         yield_pct = yield_raw * 100
         
-        # ピーター・リンチ式 (成長率は最大25%でキャップ)
+        # 成長率キャップ (最大25%)
         capped_growth = min(growth_pct, 25.0)
         if capped_growth < 0: capped_growth = 0
         
-        fair_value = eps * (capped_growth + yield_pct)
+        # ピーター・リンチ式 適正株価 = EPS * (成長率 + 配当利回り)
+        # 成長率+配当が低すぎる(例えば合計3%未満)と適正株価が極端に低くなるが、計算としては正しい
+        multiplier = capped_growth + yield_pct
         
-        if fair_value <= 0: return None
+        # マルチプライヤーが低すぎる場合の補正（最低でもPER 5倍程度はあると仮定するなどの調整も可能だが、今回は式の通りにする）
+        if multiplier < 1.0: 
+             # 成長+配当がほぼ0の企業は適正株価が出ないためスキップ
+             skip_reasons["Abnormal_Data"] += 1
+             return None
 
+        fair_value = eps * multiplier
+        
+        # 割安度
         upside = ((fair_value - price) / price) * 100
         
-        # 異常値除外 (1000%以上はデータミスの可能性が高い)
-        if upside > 1000: return None
+        # 異常値除外 (1000%以上はデータエラーの可能性が高いので弾く)
+        if upside > 1000: 
+            skip_reasons["Abnormal_Data"] += 1
+            return None
 
         return {
             'id': code,
@@ -111,6 +144,7 @@ def analyze_stock(args):
         }
         
     except Exception:
+        skip_reasons["Abnormal_Data"] += 1
         return None
 
 # --- 2. データ取得 (SBIソース) ---
@@ -118,8 +152,13 @@ def fetch_target_list():
     print("Fetching index data from SBI Source...")
     url = "https://site1.sbisec.co.jp/ETGate/WPLETmgR001Control?OutSide=on&getFlg=on&burl=search_market&cat1=market&cat2=info&dir=info&file=market_meigara_400.html"
     
+    # 偽装ヘッダーを追加
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+
     try:
-        res = requests.get(url, timeout=10)
+        res = requests.get(url, headers=headers, timeout=15)
         res.encoding = "cp932"
         
         dfs = pd.read_html(res.text)
@@ -133,12 +172,21 @@ def fetch_target_list():
             if len(dfs) > 1:
                 target_df = dfs[1]
             else:
+                print("Error: Table not found.")
                 sys.exit(1)
 
         codes = target_df.iloc[:, 0].astype(str).str.zfill(4).tolist()
         names = target_df.iloc[:, 1].astype(str).tolist()
         
-        return list(zip(codes, names))
+        # 重複削除
+        unique_list = []
+        seen = set()
+        for c, n in zip(codes, names):
+            if c not in seen:
+                unique_list.append((c, n))
+                seen.add(c)
+        
+        return unique_list
 
     except Exception as e:
         print(f"Error fetching list: {e}")
@@ -148,14 +196,11 @@ def fetch_target_list():
 def build_payload(data):
     today = datetime.datetime.now(pytz.timezone('Asia/Tokyo')).strftime('%Y/%m/%d')
 
-    # タイトルと説明文を日本語化
     html = f"""
     <h3>JPX400 適正株価分析 ({today})</h3>
-    <p style="font-size: 0.8em; margin-bottom: 10px;">ピーター・リンチの指標に基づき算出（成長率上限25%）。<br>※投資判断の参考情報であり、正確性を保証しません。</p>
+    <p style="font-size: 0.8em; margin-bottom: 10px;">ピーター・リンチ指標(成長率上限25%)に基づく試算。<br>※投資判断の参考情報であり、正確性を保証しません。</p>
     """
     
-    # CSSで徹底的にコンパクト化
-    # font-size: 10px, line-height: 1.1, padding: 2px
     html += '<table style="font-size: 10px; line-height: 1.1; border-collapse: collapse; width: 100%; text-align: left;">'
     html += """
     <thead style="background-color: #f4f4f4;">
@@ -172,7 +217,7 @@ def build_payload(data):
     
     for item in data:
         diff_val = item['diff']
-        diff_str = f"{diff_val:+.0f}%" # 小数点も消してさらに短く (必要なら .1fに戻してください)
+        diff_str = f"{diff_val:+.0f}%"
         
         color = "#d32f2f" if diff_val > 0 else "#1976d2"
         diff_html = f'<span style="color: {color}; font-weight: bold;">{diff_str}</span>'
@@ -189,7 +234,7 @@ def build_payload(data):
         html += row
 
     html += "</tbody></table>"
-    html += "<br><small style='font-size:9px; color:#777;'>自動計算ロジックにより生成</small>"
+    html += f"<br><small style='font-size:9px; color:#777;'>分析対象: {len(data)}銘柄 (除外: 赤字/データ欠損)</small>"
     
     return html
 
@@ -228,12 +273,14 @@ if __name__ == "__main__":
     check_calendar()
     
     target_list = fetch_target_list()
-    print(f"Target count: {len(target_list)}")
+    print(f"List loaded: {len(target_list)} stocks.")
     
     results = []
     
-    # 対策: 並列数を20 -> 4 に減らし、ゆっくり確実に取る
-    print("Processing stocks (slow mode for reliability)...")
+    # 並列数を少し制限して確実に取得する (max_workers=4)
+    # 時間がかかっても良いとのことなので、安全策をとる
+    print("Processing stocks... (This may take a few minutes)")
+    
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
         futures = list(executor.map(analyze_stock, target_list))
         
@@ -241,10 +288,18 @@ if __name__ == "__main__":
         if res is not None:
             results.append(res)
 
-    print(f"Success count: {len(results)}")
+    print("-" * 30)
+    print(f"Analysis Finished.")
+    print(f"Success: {len(results)}")
+    print(f"Skipped Details:")
+    print(f"  - No EPS/Red Ink: {skip_reasons['No_EPS']}")
+    print(f"  - No Price Data : {skip_reasons['No_Price']}")
+    print(f"  - API Error     : {skip_reasons['Fetch_Error']}")
+    print(f"  - Data Abnormal : {skip_reasons['Abnormal_Data']}")
+    print("-" * 30)
 
     if not results:
-        print("No data.")
+        print("No valid data found.")
         sys.exit(0)
 
     sorted_data = sorted(results, key=lambda x: x['diff'], reverse=True)
