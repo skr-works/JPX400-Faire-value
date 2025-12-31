@@ -28,7 +28,7 @@ except json.JSONDecodeError:
     print("Invalid configuration format.")
     sys.exit(1)
 
-# --- グローバル変数: スキップ理由の集計用 ---
+# --- 集計用変数 ---
 skip_reasons = {
     "No_Price": 0,
     "No_EPS": 0,
@@ -51,28 +51,26 @@ def check_calendar():
 
     print(f"Market Open: {today}")
 
-# --- 個別銘柄処理 (リトライと強化版) ---
+# --- 個別銘柄処理 (高速化版) ---
 def analyze_stock(args):
     code, jp_name = args
     ticker_symbol = f"{code}.T"
     
-    # ブロック回避のためのランダム待機
-    time.sleep(random.uniform(1.0, 3.0))
+    # 高速化のため待機時間を最小限に
+    time.sleep(0.1)
 
-    # リトライ処理 (最大3回)
     info = None
-    for i in range(3):
+    # リトライ処理 (2回程度に短縮)
+    for i in range(2):
         try:
             stock = yf.Ticker(ticker_symbol)
-            # info取得を試みる
             info = stock.info
             if info and 'currentPrice' in info:
-                break # 成功したらループを抜ける
+                break
         except Exception:
-            time.sleep(2) # エラー時は少し待って再試行
+            time.sleep(0.5)
             pass
     
-    # 3回やってもダメ、または必須データがない場合
     if info is None:
         skip_reasons["Fetch_Error"] += 1
         return None
@@ -83,54 +81,42 @@ def analyze_stock(args):
             skip_reasons["No_Price"] += 1
             return None
 
-        # EPS取得 (優先順位: forward -> trailing -> 0)
-        # 日本株はforwardEpsが欠損していることが多い
+        # EPS取得
         eps = info.get('forwardEps')
         if eps is None:
             eps = info.get('trailingEps')
             
-        # EPSがどうしても取れない、または赤字(マイナス)の場合は計算不能
         if eps is None or eps <= 0:
             skip_reasons["No_EPS"] += 1
             return None
 
-        # 成長率 (earningsGrowthがない場合が多いので、revenueGrowthを見る。なければ0とする)
+        # 成長率
         growth_raw = info.get('earningsGrowth')
         if growth_raw is None:
             growth_raw = info.get('revenueGrowth')
-        
-        # 成長率不明時は 0% (保守的) とする ※以前は5%だったが、より確実に通すため0%採用
         if growth_raw is None:
             growth_raw = 0.0
 
-        # 配当利回り
+        # 配当
         yield_raw = info.get('dividendYield', 0)
         if yield_raw is None: yield_raw = 0
 
-        # 計算
         growth_pct = growth_raw * 100
         yield_pct = yield_raw * 100
         
-        # 成長率キャップ (最大25%)
+        # 成長率キャップ 25%
         capped_growth = min(growth_pct, 25.0)
         if capped_growth < 0: capped_growth = 0
         
-        # ピーター・リンチ式 適正株価 = EPS * (成長率 + 配当利回り)
-        # 成長率+配当が低すぎる(例えば合計3%未満)と適正株価が極端に低くなるが、計算としては正しい
         multiplier = capped_growth + yield_pct
-        
-        # マルチプライヤーが低すぎる場合の補正（最低でもPER 5倍程度はあると仮定するなどの調整も可能だが、今回は式の通りにする）
         if multiplier < 1.0: 
-             # 成長+配当がほぼ0の企業は適正株価が出ないためスキップ
              skip_reasons["Abnormal_Data"] += 1
              return None
 
         fair_value = eps * multiplier
         
-        # 割安度
         upside = ((fair_value - price) / price) * 100
         
-        # 異常値除外 (1000%以上はデータエラーの可能性が高いので弾く)
         if upside > 1000: 
             skip_reasons["Abnormal_Data"] += 1
             return None
@@ -147,52 +133,47 @@ def analyze_stock(args):
         skip_reasons["Abnormal_Data"] += 1
         return None
 
-# --- 2. データ取得 (SBIソース) ---
+# --- 2. データ取得 (SBIリスト・クラス指定版) ---
 def fetch_target_list():
     print("Fetching index data from SBI Source...")
     url = "https://site1.sbisec.co.jp/ETGate/WPLETmgR001Control?OutSide=on&getFlg=on&burl=search_market&cat1=market&cat2=info&dir=info&file=market_meigara_400.html"
     
-    # 偽装ヘッダーを追加
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
     try:
-        res = requests.get(url, headers=headers, timeout=15)
+        res = requests.get(url, headers=headers, timeout=20)
         res.encoding = "cp932"
         
-        dfs = pd.read_html(res.text)
-        target_df = None
-        for df in dfs:
-            if df.shape[1] >= 2 and df.iloc[:, 0].astype(str).str.match(r'\d{4}').any():
-                target_df = df
-                break
+        # 修正済: md-l-table-01 クラスを指定して取得
+        dfs = pd.read_html(res.text, attrs={"class": "md-l-table-01"}, header=0)
         
-        if target_df is None:
-            if len(dfs) > 1:
-                target_df = dfs[1]
-            else:
-                print("Error: Table not found.")
-                sys.exit(1)
-
-        codes = target_df.iloc[:, 0].astype(str).str.zfill(4).tolist()
-        names = target_df.iloc[:, 1].astype(str).tolist()
+        if not dfs:
+            print("Error: Target table (class='md-l-table-01') not found.")
+            sys.exit(1)
+            
+        target_df = dfs[0]
         
-        # 重複削除
-        unique_list = []
-        seen = set()
-        for c, n in zip(codes, names):
-            if c not in seen:
-                unique_list.append((c, n))
-                seen.add(c)
-        
-        return unique_list
+        if '銘柄コード' in target_df.columns and '銘柄名' in target_df.columns:
+            codes = target_df['銘柄コード'].astype(str).str.strip().tolist()
+            names = target_df['銘柄名'].astype(str).str.strip().tolist()
+            
+            clean_list = []
+            for c, n in zip(codes, names):
+                if c.isdigit() and len(c) == 4:
+                    clean_list.append((c, n))
+            
+            return clean_list
+        else:
+            print("Error: Unexpected table columns.")
+            sys.exit(1)
 
     except Exception as e:
         print(f"Error fetching list: {e}")
         sys.exit(1)
 
-# --- 3. レポート生成 (日本語・超コンパクト) ---
+# --- 3. レポート生成 ---
 def build_payload(data):
     today = datetime.datetime.now(pytz.timezone('Asia/Tokyo')).strftime('%Y/%m/%d')
 
@@ -273,15 +254,14 @@ if __name__ == "__main__":
     check_calendar()
     
     target_list = fetch_target_list()
-    print(f"List loaded: {len(target_list)} stocks.")
+    print(f"List loaded: {len(target_list)} stocks found.")
     
     results = []
     
-    # 並列数を少し制限して確実に取得する (max_workers=4)
-    # 時間がかかっても良いとのことなので、安全策をとる
-    print("Processing stocks... (This may take a few minutes)")
+    # 高速化: max_workersを20に戻し、並列処理を強化
+    print(f"Processing {len(target_list)} stocks (Fast Mode)...")
     
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
         futures = list(executor.map(analyze_stock, target_list))
         
     for res in futures:
