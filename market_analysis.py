@@ -10,6 +10,7 @@ import concurrent.futures
 import jpholiday
 import time
 import random
+import math  # 追加: 平方根計算用
 from io import StringIO
 import logging
 
@@ -34,14 +35,6 @@ except json.JSONDecodeError:
 logger = logging.getLogger('yfinance')
 logger.setLevel(logging.CRITICAL)
 
-# --- 集計用変数 ---
-skip_reasons = {
-    "No_Price": 0,
-    "No_EPS": 0,
-    "Abnormal_Data": 0,
-    "Fetch_Error": 0
-}
-
 # --- 1. カレンダーチェック ---
 def check_calendar():
     jst_tz = pytz.timezone('Asia/Tokyo')
@@ -57,7 +50,7 @@ def check_calendar():
 
     print(f"Market Open: {today}")
 
-# --- 個別銘柄処理 ---
+# --- 個別銘柄処理 (グレアム数版) ---
 def analyze_stock(args):
     code, jp_name = args
     ticker_symbol = f"{code}.T"
@@ -76,82 +69,73 @@ def analyze_stock(args):
             pass
     
     if info is None:
-        skip_reasons["Fetch_Error"] += 1
-        return None
+        return {'status': 'error', 'code': code, 'reason': 'Fetch Failed'}
 
     try:
         price = info.get('currentPrice')
         if price is None:
-            skip_reasons["No_Price"] += 1
-            return None
+            return {'status': 'error', 'code': code, 'reason': 'No Price'}
 
-        # --- EPS取得ロジック (強化版) ---
+        # --- 1. EPS (1株当たり利益) の取得 ---
+        # 予想EPSを優先、なければ実績EPS
         eps = info.get('forwardEps')
         if eps is None:
             eps = info.get('trailingEps')
         
-        # それでも取れない場合、PERから逆算を試みる (EPS = 株価 / PER)
+        # それでもなければPERから逆算
         if eps is None:
             pe = info.get('trailingPE')
             if pe and pe > 0:
                 eps = price / pe
 
-        # 【バグ修正】Noneチェックを分離
-        if eps is None:
-            skip_reasons["No_EPS"] += 1
-            return None
-        
-        # 赤字企業は対象外 (0以下チェック)
-        if eps <= 0:
-            skip_reasons["No_EPS"] += 1
-            return None
+        # EPSがない、または赤字の場合は計算不能 (グレアム数はルート計算するため正の数必須)
+        if eps is None or eps <= 0:
+            return {'status': 'error', 'code': code, 'reason': 'Red Ink (EPS <= 0)'}
 
-        # --- 成長率・配当 ---
-        growth_raw = info.get('earningsGrowth')
-        if growth_raw is None:
-            growth_raw = info.get('revenueGrowth')
+        # --- 2. BPS (1株当たり純資産) の取得 ---
+        bps = info.get('bookValue')
         
-        # 成長率なしならデフォルト3%
-        if growth_raw is None:
-            growth_raw = 0.03
+        # BPSがない場合、PBRから逆算 (BPS = 株価 / PBR)
+        if bps is None:
+            pbr = info.get('priceToBook')
+            if pbr and pbr > 0:
+                bps = price / pbr
+        
+        # 債務超過(BPSマイナス)の場合は計算不能
+        if bps is None or bps <= 0:
+            return {'status': 'error', 'code': code, 'reason': 'Deficit (BPS <= 0)'}
 
-        yield_raw = info.get('dividendYield', 0)
-        if yield_raw is None: yield_raw = 0
+        # --- 3. グレアム数 (理論株価) の計算 ---
+        # 公式: √ (22.5 * EPS * BPS)
+        # 意味: PER 15倍 × PBR 1.5倍 = 22.5 を基準とした理論値
+        try:
+            graham_number = math.sqrt(22.5 * eps * bps)
+        except ValueError:
+            return {'status': 'error', 'code': code, 'reason': 'Math Domain Error'}
 
-        growth_pct = growth_raw * 100
-        yield_pct = yield_raw * 100
+        fair_value = graham_number
         
-        # 成長率キャップ
-        capped_growth = min(growth_pct, 25.0)
-        if capped_growth < 0: capped_growth = 0
-        
-        # --- 計算ロジック (緩和版) ---
-        # 成長+配当が低い場合でも、最低評価倍率(PER 5倍相当)を保証して表示させる
-        base_multiplier = capped_growth + yield_pct
-        multiplier = max(base_multiplier, 5.0) 
-
-        fair_value = eps * multiplier
-        
+        # 割安度 (%)
         upside = ((fair_value - price) / price) * 100
         
-        # 異常値除外 (5000%など極端なものだけ弾く)
-        if upside > 5000: 
-            skip_reasons["Abnormal_Data"] += 1
-            return None
+        # それでも異常値(例えば+500%など)が出る場合は、データミスの可能性が高いので弾く
+        # ※グレアム数で+300%以上はよほどの資産バリュー株でない限り稀
+        if upside > 300: 
+             return {'status': 'error', 'code': code, 'reason': f'Too High (>300%): {upside:.0f}%'}
 
         return {
+            'status': 'success',
             'id': code,
             'label': jp_name,
             'val': price,
             'target': fair_value,
-            'diff': upside
+            'diff': upside,
+            'eps': eps,  # 参考データ
+            'bps': bps   # 参考データ
         }
         
     except Exception as e:
-        # デバッグ用に最初のエラーだけ表示(必要なら)
-        # print(f"Error {code}: {e}") 
-        skip_reasons["Abnormal_Data"] += 1
-        return None
+        return {'status': 'error', 'code': code, 'reason': str(e)}
 
 # --- 2. データ取得 ---
 def fetch_target_list():
@@ -166,7 +150,6 @@ def fetch_target_list():
         res = requests.get(url, headers=headers, timeout=20)
         res.encoding = "cp932"
         
-        # pandas警告対策
         dfs = pd.read_html(StringIO(res.text), attrs={"class": "md-l-table-01"}, header=0)
         
         if not dfs:
@@ -198,8 +181,12 @@ def build_payload(data):
     today = datetime.datetime.now(pytz.timezone('Asia/Tokyo')).strftime('%Y/%m/%d')
 
     html = f"""
-    <h3>JPX400 適正株価分析 ({today})</h3>
-    <p style="font-size: 0.8em; margin-bottom: 10px;">ピーター・リンチ指標(成長率上限25%)に基づく試算。<br>※投資判断の参考情報であり、正確性を保証しません。</p>
+    <h3>JPX400 理論株価 ({today})</h3>
+    <p style="font-size: 0.8em; margin-bottom: 10px;">
+    ベンジャミン・グレアムのミックス係数に基づき算出。<br>
+    <span style="background:#eee; padding:2px;">理論値 = √(22.5 × EPS × BPS)</span><br>
+    ※資産と利益の両面から見た保守的な適正価格です。
+    </p>
     """
     
     html += '<table style="font-size: 10px; line-height: 1.1; border-collapse: collapse; width: 100%; text-align: left;">'
@@ -209,8 +196,8 @@ def build_payload(data):
             <th style="padding: 2px 4px;">コード</th>
             <th style="padding: 2px 4px;">銘柄名</th>
             <th style="padding: 2px 4px;">株価</th>
-            <th style="padding: 2px 4px;">適正</th>
-            <th style="padding: 2px 4px;">割安度</th>
+            <th style="padding: 2px 4px;">理論値</th>
+            <th style="padding: 2px 4px;">乖離</th>
         </tr>
     </thead>
     <tbody>
@@ -220,7 +207,12 @@ def build_payload(data):
         diff_val = item['diff']
         diff_str = f"{diff_val:+.0f}%"
         
+        # 割安(プラス)は赤、割高(マイナス)は青
         color = "#d32f2f" if diff_val > 0 else "#1976d2"
+        # 乖離が0に近い場合(適正圏内)は黒にする
+        if -10 < diff_val < 10:
+            color = "#333"
+
         diff_html = f'<span style="color: {color}; font-weight: bold;">{diff_str}</span>'
             
         row = f"""
@@ -235,7 +227,7 @@ def build_payload(data):
         html += row
 
     html += "</tbody></table>"
-    html += f"<br><small style='font-size:9px; color:#777;'>分析対象: {len(data)}銘柄 (除外: 赤字/データ欠損)</small>"
+    html += f"<br><small style='font-size:9px; color:#777;'>分析対象: {len(data)}銘柄 (除外: 赤字/債務超過/データ欠損)</small>"
     
     return html
 
@@ -276,32 +268,39 @@ if __name__ == "__main__":
     target_list = fetch_target_list()
     print(f"List loaded: {len(target_list)} stocks found.")
     
-    results = []
+    success_results = []
+    error_log = []
     
-    print(f"Processing {len(target_list)} stocks (Fast Mode)...")
+    print(f"Processing {len(target_list)} stocks (Graham Method)...")
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
         futures = list(executor.map(analyze_stock, target_list))
         
     for res in futures:
-        if res is not None:
-            results.append(res)
+        if res is None: continue
+        if res['status'] == 'success':
+            success_results.append(res)
+        else:
+            error_log.append(res)
 
     print("-" * 30)
     print(f"Analysis Finished.")
-    print(f"Success: {len(results)}")
-    print(f"Skipped Details:")
-    print(f"  - No EPS/Red Ink: {skip_reasons['No_EPS']}")
-    print(f"  - No Price Data : {skip_reasons['No_Price']}")
-    print(f"  - API Error     : {skip_reasons['Fetch_Error']}")
-    print(f"  - Data Abnormal : {skip_reasons['Abnormal_Data']}")
+    print(f"Success: {len(success_results)}")
+    print(f"Skipped: {len(error_log)}")
+    
+    # エラー詳細(トップ10)
+    if error_log:
+        print("\n--- Skip Reasons (Top 10) ---")
+        for err in error_log[:10]:
+            print(f"[{err['code']}] {err['reason']}")
     print("-" * 30)
 
-    if not results:
+    if not success_results:
         print("No valid data found.")
         sys.exit(0)
 
-    sorted_data = sorted(results, key=lambda x: x['diff'], reverse=True)
+    # 割安度順にソート
+    sorted_data = sorted(success_results, key=lambda x: x['diff'], reverse=True)
     
     report_html = build_payload(sorted_data)
     sync_remote_node(report_html)
