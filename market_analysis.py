@@ -8,7 +8,7 @@ import yfinance as yf
 import json
 import concurrent.futures
 import jpholiday
-from io import StringIO # 追加: 文字列をファイルのように扱う
+# from io import StringIO # SBIの取得方式では不要なため削除
 
 # --- 設定: 汎用的な同期設定として読み込み (中身がWPであることは隠蔽) ---
 try:
@@ -47,7 +47,7 @@ def check_calendar():
 # --- 個別銘柄処理 ---
 def analyze_stock(args):
     code, jp_name = args
-    ticker_symbol = f"{code}.T"
+    ticker_symbol = f"{code}.T" # ここで.Tをつけるので、リスト取得時はコードのみにする
     
     try:
         stock = yf.Ticker(ticker_symbol)
@@ -95,41 +95,43 @@ def analyze_stock(args):
     except Exception:
         return None
 
-# --- 2. データ取得 (JPX400 + 日本語社名) ---
+# --- 2. データ取得 (JPX400: SBI証券ソースに変更) ---
 def fetch_target_list():
-    print("Fetching index data...")
-    url = 'https://ja.wikipedia.org/wiki/JPX%E6%97%A5%E7%B5%8C%E3%82%A4%E3%83%B3%E3%83%87%E3%83%83%E3%82%AF%E3%82%B9400'
+    print("Fetching index data from SBI Source...")
+    # 頂いたコードのURLを使用
+    url = "https://site1.sbisec.co.jp/ETGate/WPLETmgR001Control?OutSide=on&getFlg=on&burl=search_market&cat1=market&cat2=info&dir=info&file=market_meigara_400.html"
     
-    # 対策: ブラウザのフリをするヘッダーを追加
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"
-    }
-
     try:
-        # requestsでHTMLを取得してからpandasに渡す
-        res = requests.get(url, headers=headers)
-        res.raise_for_status()
+        res = requests.get(url, timeout=10)
+        res.encoding = "cp932" # 日本語エンコーディング対応
         
-        # StringIOでラップして渡す
-        tables = pd.read_html(StringIO(res.text))
+        # HTMLテーブルを解析
+        dfs = pd.read_html(res.text)
         
-        df_target = None
-        for table in tables:
-            if 'コード' in table.columns and '銘柄名' in table.columns:
-                df_target = table
+        target_df = None
+        for df in dfs:
+            # 銘柄コード(数字4桁)が含まれる列を探すロジック
+            if df.shape[1] >= 2 and df.iloc[:, 0].astype(str).str.match(r'\d{4}').any():
+                target_df = df
                 break
         
-        if df_target is None:
-            print("Error: Target table not found in Wikipedia.")
-            sys.exit(1)
-            
-        codes = df_target['コード'].astype(str).tolist()
-        names = df_target['銘柄名'].astype(str).tolist()
+        if target_df is None:
+            # 見つからない場合は2番目のテーブルを仮定(参考コード準拠)
+            if len(dfs) > 1:
+                target_df = dfs[1]
+            else:
+                print("Error: Target table not found.")
+                sys.exit(1)
+
+        # 0列目: コード, 1列目: 銘柄名
+        # analyze_stockで.Tをつけるため、ここでは数字のみ(文字列)にする
+        codes = target_df.iloc[:, 0].astype(str).str.zfill(4).tolist()
+        names = target_df.iloc[:, 1].astype(str).tolist()
         
         return list(zip(codes, names))
 
     except Exception as e:
-        print(f"Error fetching list: {e}") # 詳細なエラーを表示
+        print(f"Error fetching list: {e}")
         sys.exit(1)
 
 # --- 3. レポート生成 ---
@@ -204,7 +206,7 @@ def sync_remote_node(content_body):
             print("Sync complete.")
         else:
             print(f"Sync failed: {res.status_code}")
-            print(res.text) # エラー詳細を表示
+            print(res.text)
             sys.exit(1)
     except Exception as e:
         print(f"Connection error: {e}")
