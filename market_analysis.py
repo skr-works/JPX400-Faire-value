@@ -184,7 +184,7 @@ def build_payload(data):
     <h3>JPX400 適正株価 ({today})</h3>
     <p>ベンジャミン・グレアムのミックス係数に基づき算出しています。<br>
     <blockquote>適正株価 = √(22.5 × EPS × BPS)</blockquote>
-    ※資産と利益の両面から見た保守的な適正価格です。</p>
+    ※PER 15倍 × PBR 1.5倍 = 22.5 を基準とした理論値です。<br>資産と利益の両面から見た保守的な適正価格です。</p>
     """
     
     html += '<table style="font-size: 10px; line-height: 1.1; border-collapse: collapse; width: 100%; text-align: left;">'
