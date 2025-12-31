@@ -7,12 +7,11 @@ import pandas as pd
 import yfinance as yf
 import json
 import concurrent.futures
-import jpholiday  # 日本の祝日判定用
+import jpholiday
+from io import StringIO # 追加: 文字列をファイルのように扱う
 
 # --- 設定: 汎用的な同期設定として読み込み (中身がWPであることは隠蔽) ---
 try:
-    # GitHub Secretsには "SYNC_CONFIG" という名前でJSONを登録する想定
-    # キー名も汎用的に: {"endpoint": "URL...", "user": "...", "token": "...", "resource_id": "..."}
     config_json = os.environ["SYNC_CONFIG"]
     config = json.loads(config_json)
     
@@ -47,7 +46,7 @@ def check_calendar():
 
 # --- 個別銘柄処理 ---
 def analyze_stock(args):
-    code, jp_name = args  # Wikipedia由来の日本語社名を受け取る
+    code, jp_name = args
     ticker_symbol = f"{code}.T"
     
     try:
@@ -56,7 +55,6 @@ def analyze_stock(args):
         
         price = info.get('currentPrice')
         
-        # EPS取得 (Forward -> Trailing)
         eps = info.get('forwardEps')
         if eps is None:
             eps = info.get('trailingEps')
@@ -64,18 +62,15 @@ def analyze_stock(args):
         if price is None or eps is None or eps <= 0:
             return None
 
-        # 成長率
         growth_raw = info.get('earningsGrowth')
         if growth_raw is None:
             growth_raw = info.get('revenueGrowth')
         if growth_raw is None:
-            growth_raw = 0.05 # Default 5%
+            growth_raw = 0.05
 
-        # 配当利回り
         yield_raw = info.get('dividendYield', 0)
         if yield_raw is None: yield_raw = 0
 
-        # 計算ロジック
         growth_pct = growth_raw * 100
         yield_pct = yield_raw * 100
         capped_growth = min(growth_pct, 25.0)
@@ -87,11 +82,11 @@ def analyze_stock(args):
 
         upside = ((fair_value - price) / price) * 100
         
-        if upside > 1000: return None # 異常値除外
+        if upside > 1000: return None
 
         return {
-            'id': code,           # .Tなし
-            'label': jp_name,     # 日本語社名
+            'id': code,
+            'label': jp_name,
             'val': price,
             'target': fair_value,
             'diff': upside
@@ -105,8 +100,19 @@ def fetch_target_list():
     print("Fetching index data...")
     url = 'https://ja.wikipedia.org/wiki/JPX%E6%97%A5%E7%B5%8C%E3%82%A4%E3%83%B3%E3%83%87%E3%83%83%E3%82%AF%E3%82%B9400'
     
+    # 対策: ブラウザのフリをするヘッダーを追加
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"
+    }
+
     try:
-        tables = pd.read_html(url)
+        # requestsでHTMLを取得してからpandasに渡す
+        res = requests.get(url, headers=headers)
+        res.raise_for_status()
+        
+        # StringIOでラップして渡す
+        tables = pd.read_html(StringIO(res.text))
+        
         df_target = None
         for table in tables:
             if 'コード' in table.columns and '銘柄名' in table.columns:
@@ -114,23 +120,22 @@ def fetch_target_list():
                 break
         
         if df_target is None:
+            print("Error: Target table not found in Wikipedia.")
             sys.exit(1)
             
-        # コードと日本語社名のペアを作成
-        # コードは数値型で来ることがあるので文字列変換
         codes = df_target['コード'].astype(str).tolist()
         names = df_target['銘柄名'].astype(str).tolist()
         
         return list(zip(codes, names))
 
-    except Exception:
+    except Exception as e:
+        print(f"Error fetching list: {e}") # 詳細なエラーを表示
         sys.exit(1)
 
 # --- 3. レポート生成 ---
 def build_payload(data):
     today = datetime.datetime.now(pytz.timezone('Asia/Tokyo')).strftime('%Y/%m/%d')
 
-    # HTML生成 (クラス名などを汎用的にして特定のCMS臭を消す)
     html = f"""
     <h3>Analysis Report: JPX400 ({today})</h3>
     <p>Based on projected EPS, growth rate (capped at 25%), and dividend yield.</p>
@@ -174,12 +179,10 @@ def build_payload(data):
     
     return html
 
-# --- 4. リモート同期 (汎用HTTPリクエスト) ---
+# --- 4. リモート同期 ---
 def sync_remote_node(content_body):
     print("Syncing with remote node...")
     
-    # URL生成ロジック (WPのAPI構造に合わせて構築するが、変数名は隠蔽)
-    # config["endpoint"] には "https://site.com" までを入れる想定
     target_url = f"{API_ENDPOINT}/wp-json/wp/v2/pages/{TARGET_ID}"
     
     headers = {
@@ -190,7 +193,6 @@ def sync_remote_node(content_body):
         'content': content_body
     }
     
-    # Basic認証
     try:
         res = requests.post(
             target_url, 
@@ -202,6 +204,7 @@ def sync_remote_node(content_body):
             print("Sync complete.")
         else:
             print(f"Sync failed: {res.status_code}")
+            print(res.text) # エラー詳細を表示
             sys.exit(1)
     except Exception as e:
         print(f"Connection error: {e}")
@@ -211,11 +214,10 @@ def sync_remote_node(content_body):
 if __name__ == "__main__":
     check_calendar()
     
-    target_list = fetch_target_list() # [(Code, Name), ...]
+    target_list = fetch_target_list()
     print(f"Processing {len(target_list)} items...")
     
     results = []
-    # 並列処理
     with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
         futures = list(executor.map(analyze_stock, target_list))
         
@@ -227,7 +229,6 @@ if __name__ == "__main__":
         print("No data.")
         sys.exit(0)
 
-    # 割安度順にソート
     sorted_data = sorted(results, key=lambda x: x['diff'], reverse=True)
     
     report_html = build_payload(sorted_data)
